@@ -1,0 +1,119 @@
+# Commands used to analyse the bivalve project data using the Mytilus galloprovencialis genome sequence (on TACC LoneStar5)
+# Most scripts used are from Mikhail Matz's 2b-RAD repository: https://github.com/z0on/2bRAD_denovo 
+
+# ==================
+# Copying the data to the right place, removing read pairs and concatenating two files for each sample.
+
+rm *_R2_001.fastq.gz
+gunzip *.gz
+./concat.sh
+
+# ==================
+
+# Indexing the genome sequence (mg10, found here: https://denovo.cnag.cat/mussel_data?fid=9#block-likable-page-title)
+export GENOME_FASTA=/work/05301/dewitp/lonestar/mytilus/ref/mg10.scaffolds.fa
+export GENOME_DICT=/work/05301/dewitp/lonestar/mytilus/ref/mg10.scaffolds.dict 
+bowtie2-build $GENOME_FASTA $GENOME_FASTA
+samtools faidx $GENOME_FASTA
+java -jar $HOME/bin/picard.jar CreateSequenceDictionary R=$GENOME_FASTA O=$GENOME_DICT
+
+# ==================
+
+# Quality control:
+
+# Trimming low-quality bases:
+
+## NOTE: Had to create new launcher and trim2bRAD_dedup.pl scripts to account for no 2nd inline barcode. ##
+
+2bRAD_trim_launch_dedup_PDW.pl fastq > trims
+ls5_launcher_creator.py -j trims -n trims -t 0:30:00 -w 24 -a tagmap -q normal -e pierre.de_wit@marine.gu.se
+sbatch trims.slurm
+
+# Filtering out adapter sequences:
+
+ls *.tr0 | perl -pe 's/^(\S+)\.tr0$/cat $1\.tr0 \| fastq_quality_filter -q 20 -p 100 >$1\.trim/' >filt0
+cat filt0 | perl -pe 's/filter /filter -Q33 /' > filt
+ls5_launcher_creator.py -j filt -n filt -t 0:30:00 -w 24 -a tagmap -q normal -e pierre.de_wit@marine.gu.se
+sbatch filt.slurm
+
+# ==================
+
+# Mapping reads to reference (mg10) and formatting bam files 
+
+GENOME_FASTA=/work/05301/dewitp/lonestar/mytilus/ref/mg10.scaffolds.fa
+>maps
+for F in `ls *.trim`; do
+echo "bowtie2 --no-unal -x $GENOME_FASTA -U $F -S $F.sam">>maps
+done
+ls5_launcher_creator.py -j maps -n maps -t 0:30:00 -w 12 -a tagmap -q normal -e pierre.de_wit@marine.gu.se
+sbatch maps.slurm
+
+ls *sam | wc -l # should be the same number as number of trim files
+
+rm *.trim
+
+# check that all samples align equally well to the reference:
+
+cat maps.e* | grep "exactly 1 time" >alignmentRates
+
+# next stage is compressing, sorting and indexing the SAM files, so they become BAM files:
+ls *.sam >sams
+
+cat sams | perl -pe 's/(\S+)\.sam/samtools import \$WORK\/mytilus\/ref\/mg10\.scaffolds\.fa $1\.sam $1\.unsorted\.bam && samtools sort -o $1\.sorted\.bam $1\.unsorted\.bam && java -Xmx5g -jar \$HOME\/bin\/picard\.jar AddOrReplaceReadGroups INPUT=$1\.sorted\.bam OUTPUT=$1\.bam RGID=group1 RGLB=lib1 RGPL=illumina RGPU=unit1 RGSM=$1 && samtools index $1\.bam/' >s2b
+ls5_launcher_creator.py -j s2b -n s2b -t 0:30:00 -w 12 -a tagmap -q normal -e pierre.de_wit@marine.gu.se
+sbatch s2b.slurm
+
+rm *sorted*
+ls *bam | wc -l  # should be the same number as number of trim files
+rm *.sam
+ls *.bam >bams
+
+#===================== A  N  G  S  D =====================
+
+#----------- assessing base qualities and coverage depth
+
+idev -A tagmap
+
+# only looking at sites sequenced in at least 50% of all individuals
+FILTERS="-uniqueOnly 1 -minMapQ 20 -minInd 301 -maxDepth 10000"
+TODO="-doQsDist 1 -doDepth 1 -doCounts 1 -dumpCounts 2"
+
+# in the following line, -rf argument specifices a file with a list of the first 10 scaffolds of the reference assembly ( about 9 Mb, no need to do this for whole genome)
+# (look up lengths of your contigs in the assembly .fai file if you need)
+
+angsd -b bams -rf qc_regions.txt -GL 1 $FILTERS $TODO -P 12 -out dd
+
+# summarizing results (using modified script by Matteo Fumagalli)
+module load Rstats/3.5.1
+Rscript ~/bin/plotQC.R prefix=dd
+
+logout
+
+# scp dd.pdf to laptop to see distribution of base quality scores and fraction of sites in each sample depending on coverage threshold
+# note the new file bams.qc: it lists only the bam files that are 3 SDs less than mean quality (quality = fraction of sites with >5x coverage, written in file quality.txt)
+
+
+#-- Doing all the angsd stuff (including also more rare polymorphisms in case some alleles are common in one pop but missing from all others, minimum 5 alleles (5/1160 = MAF 0.004)
+#-- also, printing out the mismatch distribution from the reference, to see if any of our samples might be M. galloprovencialis.
+
+FILTERS="-uniqueOnly 1 -skipTriallelic 1 -minMapQ 20 -minQ 20 -dosnpstat 1 -doHWE 1 -sb_pval 1e-5 -hetbias_pval 1e-5 -minInd 290 -snp_pval 1e-5 -minMaf 0.004"
+TODO="-doMajorMinor 1 -doMaf 1 -doCounts 1 -makeMatrix 1 -doIBS 1 -doCov 1 -doGeno 8 -doPost 1 -doGlf 2 -doMisMatch 1"
+export GENOME_REF=/work/05301/dewitp/lonestar/mytilus/ref/mg10.scaffolds.fa
+echo "angsd -b bams.nc -GL 1 -ref $GENOME_REF $FILTERS $TODO -P 12 -out OK" >ab
+ls5_launcher_creator.py -j ab -n ab -t 8:00:00 -a mega2014 -e pierre.de_wit@marine.gu.se -w 1 -q normal
+sbatch ab.slurm
+
+
+
+# ------- PCAngsd: estimating admixture, kinship, and SNP covariance
+
+idev -A mega2014
+
+module load python2
+python ~/pcangsd/pcangsd.py -beagle OK.beagle.gz -admix -o pcangsd -inbreed 2 -kinship -selection -threads 12
+
+logout
+
+# making a table of bams : population correspondence called inds2pops 
+
+# transfer inds2pops, pcangsd* and OK.ibsMat files to laptop, proceed with admixturePlotting_pcangsd.R, PCA and MDS plotting.R and the EEMS pipeline.
